@@ -24,6 +24,8 @@ FEISHU_TABLE_ID = os.getenv("FEISHU_TABLE_ID", "tblZ1KmICNtpVEMX")
 ZSXQ_GROUP_ID = os.getenv("ZSXQ_GROUP_ID", "28885442528241")
 STORAGE_STATE_PATH = os.getenv("STORAGE_STATE_PATH", "zsxq_storage_state.json")
 DASHBOARD_URL = f"https://wx.zsxq.com/dashboard/{ZSXQ_GROUP_ID}/income"
+MEMBER_ACTIVE_URL = f"https://wx.zsxq.com/dashboard/{ZSXQ_GROUP_ID}/member_active"
+CONTENT_ACTIVE_URL = f"https://wx.zsxq.com/dashboard/{ZSXQ_GROUP_ID}/content_active"
 
 BJT = timezone(timedelta(hours=8))
 BASE = "https://open.feishu.cn/open-apis"
@@ -65,10 +67,16 @@ def ensure_fields(token, table_id, field_names):
     if resp.json().get("code") == 0:
         for f in resp.json().get("data", {}).get("items", []):
             existing.add(f["field_name"])
+    created = 0
     for name in field_names:
         if name not in existing:
-            requests.post(url, headers=feishu_headers(token), json={"field_name": name, "type": 1})
-            time.sleep(0.2)
+            r = requests.post(url, headers=feishu_headers(token), json={"field_name": name, "type": 1})
+            if r.json().get("code") == 0:
+                created += 1
+            time.sleep(0.3)
+    if created > 0:
+        print(f"    新建 {created} 个字段")
+        time.sleep(1)  # 等待字段创建生效
 
 
 def find_or_create_detail_table(token):
@@ -100,11 +108,32 @@ def find_or_create_detail_table(token):
     return None
 
 
+def find_or_create_table(token, table_name, fields):
+    """查找或创建指定名称的表"""
+    url = f"{BASE}/bitable/v1/apps/{FEISHU_APP_TOKEN}/tables"
+    resp = requests.get(url, headers=feishu_headers(token))
+    if resp.json().get("code") == 0:
+        for t in resp.json().get("data", {}).get("items", []):
+            if t["name"] == table_name:
+                return t["table_id"]
+    create_resp = requests.post(url, headers=feishu_headers(token), json={
+        "table": {
+            "name": table_name,
+            "default_view_name": "默认视图",
+            "fields": [{"field_name": f, "type": 1} for f in fields]
+        }
+    })
+    data = create_resp.json()
+    if data.get("code") == 0:
+        return data["data"]["table_id"]
+    return None
+
+
 # ──────────────────────────── 爬取知识星球 ────────────────────────────
 
 
 async def scrape_zsxq():
-    """用 Playwright 打开知识星球收入页面，提取概览数据和交易明细"""
+    """用 Playwright 打开知识星球各页面，提取概览数据、交易明细、成员活跃、内容活跃"""
 
     if not os.path.exists(STORAGE_STATE_PATH):
         print(f"错误: 找不到 {STORAGE_STATE_PATH}")
@@ -115,7 +144,8 @@ async def scrape_zsxq():
         context = await browser.new_context(storage_state=STORAGE_STATE_PATH)
         page = await context.new_page()
 
-        print(f"打开: {DASHBOARD_URL}")
+        # ── 1. 收入页面 ──
+        print(f"  打开: {DASHBOARD_URL}")
         await page.goto(DASHBOARD_URL, wait_until="networkidle", timeout=60000)
         await page.wait_for_timeout(8000)
 
@@ -124,10 +154,9 @@ async def scrape_zsxq():
             await browser.close()
             sys.exit(1)
 
-        # ── 提取概览数据 ──
-        page_text = await page.evaluate("() => document.body.innerText")
+        income_text = await page.evaluate("() => document.body.innerText")
 
-        # ── 提取交易明细（逐页） ──
+        # 提取交易明细（逐页）
         all_transactions = []
         for i in range(30):
             rows = await page.evaluate("""() => {
@@ -148,7 +177,7 @@ async def scrape_zsxq():
                 break
             await page.wait_for_timeout(2500)
 
-        # 去重（分页可能重复抓取同一页）
+        # 去重
         seen = set()
         unique_transactions = []
         for t in all_transactions:
@@ -156,11 +185,84 @@ async def scrape_zsxq():
                 seen.add(t)
                 unique_transactions.append(t)
 
+        # ── 2. 成员活跃页面 ──
+        print(f"  打开: {MEMBER_ACTIVE_URL}")
+        await page.goto(MEMBER_ACTIVE_URL, wait_until="networkidle", timeout=60000)
+        await page.wait_for_timeout(5000)
+        member_active_text = await page.evaluate("() => document.body.innerText")
+
+        # 提取成员明细（逐页）
+        all_members = []
+        for i in range(30):
+            rows = await page.evaluate("""() => {
+                return Array.from(document.querySelectorAll('ul li')).filter(li => {
+                    return /20\\d{2}\\//.test(li.innerText) && li.innerText.includes('\\n');
+                }).map(li => li.innerText.trim());
+            }""")
+            if not rows:
+                break
+            all_members.extend(rows)
+            can_next = await page.evaluate("""() => {
+                const btn = document.querySelector('.page-next');
+                if (!btn || btn.classList.contains('page-next-disabled')) return false;
+                btn.click();
+                return true;
+            }""")
+            if not can_next:
+                break
+            await page.wait_for_timeout(2500)
+        seen_m = set()
+        unique_members = []
+        for m in all_members:
+            if m not in seen_m:
+                seen_m.add(m)
+                unique_members.append(m)
+
+        # ── 3. 内容活跃页面 ──
+        print(f"  打开: {CONTENT_ACTIVE_URL}")
+        await page.goto(CONTENT_ACTIVE_URL, wait_until="networkidle", timeout=60000)
+        await page.wait_for_timeout(5000)
+        content_active_text = await page.evaluate("() => document.body.innerText")
+
+        # 提取内容明细（逐页）
+        all_contents = []
+        for i in range(30):
+            rows = await page.evaluate("""() => {
+                return Array.from(document.querySelectorAll('ul li')).filter(li => {
+                    return /20\\d{2}\\//.test(li.innerText) && li.innerText.includes('\\n');
+                }).map(li => li.innerText.trim());
+            }""")
+            if not rows:
+                break
+            all_contents.extend(rows)
+            can_next = await page.evaluate("""() => {
+                const btn = document.querySelector('.page-next');
+                if (!btn || btn.classList.contains('page-next-disabled')) return false;
+                btn.click();
+                return true;
+            }""")
+            if not can_next:
+                break
+            await page.wait_for_timeout(2500)
+        seen_c = set()
+        unique_contents = []
+        for c in all_contents:
+            if c not in seen_c:
+                seen_c.add(c)
+                unique_contents.append(c)
+
         # 刷新 cookies
         await context.storage_state(path=STORAGE_STATE_PATH)
         await browser.close()
 
-    return page_text, unique_transactions
+    return {
+        "income_text": income_text,
+        "transactions": unique_transactions,
+        "member_active_text": member_active_text,
+        "members": unique_members,
+        "content_active_text": content_active_text,
+        "contents": unique_contents,
+    }
 
 
 def parse_overview(text):
@@ -239,6 +341,99 @@ def parse_transactions(raw_rows):
     return records
 
 
+def parse_member_active(text):
+    """从成员活跃页面文本解析概览数据"""
+    record = {}
+    patterns = {
+        "免费加入成员": r"免费加入成员\s*\n\s*(\d+)",
+        "退出成员": r"退出成员\s*\n\s*(\d+)",
+        "月活跃成员": r"(\d+)\s*\n\s*月活跃成员",
+        "未过期活跃成员": r"未过期的活跃成员\s*\n\s*(\d+)",
+        "已过期活跃成员": r"已过期的活跃成员\s*\n\s*(\d+)",
+        "新成员月流失率": r"([\d.]+%)\s*\n\s*新成员月流失率",
+        "近30日新加入成员": r"近30日新加入成员\s*\n\s*(\d+)",
+        "新成员月留存数": r"新成员月留存数\s*\n\s*(\d+)",
+        "新成员月流失数": r"新成员月流失数\s*\n\s*(\d+)",
+    }
+    for field, pattern in patterns.items():
+        m = re.search(pattern, text)
+        if m:
+            record[field] = m.group(1)
+    return record
+
+
+def parse_member_detail(raw_rows):
+    """解析成员明细文本行"""
+    records = []
+    for row in raw_rows:
+        parts = [p.strip() for p in row.split("\n") if p.strip()]
+        # 典型格式: 昵称 [手机号/微信号] 编号 加入时间 最后活跃 到期时间 已续期数 主题数
+        # 有些成员有手机号/微信号，有些没有，需要灵活处理
+        # 找到日期字段的位置
+        date_indices = [i for i, p in enumerate(parts) if re.match(r'\d{4}/\d{2}/\d{2}', p)]
+        if len(date_indices) >= 2:
+            first_date_idx = date_indices[0]
+            record = {
+                "用户昵称": parts[0],
+                "成员编号": parts[first_date_idx - 1] if first_date_idx > 1 else "",
+                "首次加入时间": parts[first_date_idx] if len(date_indices) >= 1 else "",
+                "最后活跃时间": parts[first_date_idx + 1] if first_date_idx + 1 < len(parts) else "",
+                "到期时间": parts[first_date_idx + 2] if first_date_idx + 2 < len(parts) else "",
+            }
+            # 续期数和主题数在到期时间之后
+            remaining = parts[first_date_idx + 3:]
+            if len(remaining) >= 2:
+                record["已续期数"] = remaining[0]
+                record["主题数"] = remaining[1]
+            records.append(record)
+    return records
+
+
+def parse_content_active(text):
+    """从内容活跃页面文本解析概览数据"""
+    record = {}
+    patterns = {
+        "主题数": r"主题数\s*\n\s*(\d+)",
+        "文件数": r"文件数\s*\n\s*(\d+)",
+        "图片数": r"图片数\s*\n\s*(\d+)",
+        "评论数": r"评论数\s*\n\s*(\d+)",
+        "点赞数": r"点赞数\s*\n\s*(\d+)",
+        "昨日新增主题": r"昨日新增主题\s+(\d+)",
+        "昨日新增文件": r"昨日新增文件\s+(\d+)",
+        "昨日新增图片": r"昨日新增图片\s+(\d+)",
+        "昨日新增评论": r"昨日新增评论\s+(\d+)",
+        "昨日新增点赞": r"昨日新增点赞\s+(\d+)",
+    }
+    for field, pattern in patterns.items():
+        m = re.search(pattern, text)
+        if m:
+            record[field] = m.group(1)
+    return record
+
+
+def parse_content_detail(raw_rows):
+    """解析内容明细文本行"""
+    records = []
+    for row in raw_rows:
+        parts = [p.strip() for p in row.split("\n") if p.strip()]
+        # 格式: 主题标题 发布时间 用户昵称 点赞数 评论数 阅读数
+        date_indices = [i for i, p in enumerate(parts) if re.match(r'\d{4}/\d{2}/\d{2}', p)]
+        if date_indices:
+            di = date_indices[0]
+            record = {
+                "主题": parts[0] if di > 0 else "",
+                "发布时间": parts[di],
+                "用户昵称": parts[di + 1] if di + 1 < len(parts) else "",
+            }
+            remaining = parts[di + 2:]
+            if len(remaining) >= 3:
+                record["点赞数"] = remaining[0]
+                record["评论数"] = remaining[1]
+                record["阅读数"] = remaining[2]
+            records.append(record)
+    return records
+
+
 # ──────────────────────────── 主流程 ────────────────────────────
 
 
@@ -250,40 +445,77 @@ async def main():
     print("=" * 60)
 
     # 1. 爬取
-    print("\n[1/3] 爬取知识星球后台...")
-    page_text, raw_transactions = await scrape_zsxq()
-    print(f"  页面文本: {len(page_text)} 字符")
-    print(f"  交易明细: {len(raw_transactions)} 条（去重后）")
+    print("\n[1/4] 爬取知识星球后台...")
+    data = await scrape_zsxq()
+    print(f"  收入页面: {len(data['income_text'])} 字符")
+    print(f"  交易明细: {len(data['transactions'])} 条")
+    print(f"  成员活跃页面: {len(data['member_active_text'])} 字符")
+    print(f"  成员明细: {len(data['members'])} 条")
+    print(f"  内容活跃页面: {len(data['content_active_text'])} 字符")
+    print(f"  内容明细: {len(data['contents'])} 条")
 
-    # 2. 解析
-    print("\n[2/3] 解析数据...")
-    overview = parse_overview(page_text)
-    transactions = parse_transactions(raw_transactions)
+    # 2. 解析收入概览 + 推广转化
+    print("\n[2/4] 解析数据...")
+    overview = parse_overview(data["income_text"])
+    transactions = parse_transactions(data["transactions"])
+
+    # 3. 解析成员活跃
+    member_overview = parse_member_active(data["member_active_text"])
+    overview.update({f"成员-{k}": v for k, v in member_overview.items()})
+    member_details = parse_member_detail(data["members"])
+
+    # 4. 解析内容活跃
+    content_overview = parse_content_active(data["content_active_text"])
+    overview.update({f"内容-{k}": v for k, v in content_overview.items()})
+    content_details = parse_content_detail(data["contents"])
+
     print(f"  概览字段: {len(overview)} 个")
     for k, v in overview.items():
         print(f"    {k}: {v}")
     print(f"  交易记录: {len(transactions)} 条")
+    print(f"  成员记录: {len(member_details)} 条")
+    print(f"  内容记录: {len(content_details)} 条")
 
     # 3. 写入飞书
-    print("\n[3/3] 写入飞书多维表格...")
+    print("\n[3/4] 写入飞书多维表格...")
     token = get_tenant_token()
 
-    # 写概览
+    # 写概览（收入 + 推广转化 + 成员活跃 + 内容活跃）
     ensure_fields(token, FEISHU_TABLE_ID, overview.keys())
     print("  写入概览数据...")
     add_records(token, FEISHU_TABLE_ID, [overview])
 
-    # 写明细
+    # 写收入明细
     if transactions:
         detail_table_id = find_or_create_detail_table(token)
         if detail_table_id:
             print(f"  写入 {len(transactions)} 条交易明细...")
-            # 分批写入（每批最多 500 条）
             for i in range(0, len(transactions), 500):
-                batch = transactions[i:i+500]
-                add_records(token, detail_table_id, batch)
-        else:
-            print("  无法获取明细表，跳过交易明细")
+                add_records(token, detail_table_id, transactions[i:i+500])
+
+    # 写成员明细
+    if member_details:
+        member_table_id = find_or_create_table(
+            token, "成员活跃明细",
+            ["用户昵称", "成员编号", "首次加入时间", "最后活跃时间", "到期时间", "已续期数", "主题数"]
+        )
+        if member_table_id:
+            ensure_fields(token, member_table_id, member_details[0].keys())
+            print(f"  写入 {len(member_details)} 条成员明细...")
+            for i in range(0, len(member_details), 500):
+                add_records(token, member_table_id, member_details[i:i+500])
+
+    # 写内容明细
+    if content_details:
+        content_table_id = find_or_create_table(
+            token, "内容活跃明细",
+            ["主题", "发布时间", "用户昵称", "点赞数", "评论数", "阅读数"]
+        )
+        if content_table_id:
+            ensure_fields(token, content_table_id, content_details[0].keys())
+            print(f"  写入 {len(content_details)} 条内容明细...")
+            for i in range(0, len(content_details), 500):
+                add_records(token, content_table_id, content_details[i:i+500])
 
     print("\n" + "=" * 60)
     print("同步完成！")
