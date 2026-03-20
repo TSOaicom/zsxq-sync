@@ -134,6 +134,13 @@ def find_or_create_table(token, table_name, fields):
 # ──────────────────────────── 爬取知识星球 ────────────────────────────
 
 
+def is_data_in_reset(text):
+    """检测知识星球后台是否处于数据重置期（凌晨~8点）"""
+    # 如果总成员数为0且昨日加入成员为负数，说明在重置期
+    m = re.search(r"总成员数\s*\n\s*0\s*\n\s*昨日加入成员\s+-\d+", text)
+    return m is not None
+
+
 async def scrape_zsxq():
     """用 Playwright 打开知识星球各页面，提取概览数据、交易明细、成员活跃、内容活跃"""
 
@@ -157,6 +164,22 @@ async def scrape_zsxq():
             sys.exit(1)
 
         income_text = await page.evaluate("() => document.body.innerText")
+
+        # 检测数据重置期并重试
+        if is_data_in_reset(income_text):
+            print("  ⚠ 检测到数据重置期（总成员数为0），等待重试...")
+            for retry in range(3):
+                wait_sec = 120 * (retry + 1)  # 120s, 240s, 360s
+                print(f"  等待 {wait_sec} 秒后第 {retry+1} 次重试...")
+                await page.wait_for_timeout(wait_sec * 1000)
+                await page.reload(wait_until="networkidle", timeout=60000)
+                await page.wait_for_timeout(8000)
+                income_text = await page.evaluate("() => document.body.innerText")
+                if not is_data_in_reset(income_text):
+                    print("  ✓ 数据已恢复正常")
+                    break
+            else:
+                print("  ⚠ 重试后数据仍在重置期，将使用恢复算法补偿")
 
         # 提取交易明细（逐页）
         all_transactions = []
@@ -349,13 +372,32 @@ def parse_overview(text):
         if m:
             record[field] = m.group(1).replace(",", "")
 
+    # ── 数据重置期恢复：如果值为0但昨日变化为负数，用负数绝对值恢复 ──
+    # 总成员数: "总成员数\n0\n昨日加入成员 -164" → 恢复为164
+    if record.get("总成员数") == "0":
+        m = re.search(r"数据概览.*?总成员数\s*\n\s*0\s*\n\s*昨日加入成员\s+(-\d+)", text, re.DOTALL)
+        if m:
+            record["总成员数"] = str(abs(int(m.group(1))))
+            print(f"  [恢复] 总成员数: 0 → {record['总成员数']}（从负昨日值恢复）")
+
+    # 付费加入成员: "付费加入成员\n0\n昨日加入成员 -52" → 恢复为52
+    if record.get("付费加入成员") == "0":
+        m = re.search(r"付费加入成员\s*\n\s*0\s*\n\s*昨日加入成员\s+(-\d+)", text)
+        if m:
+            record["付费加入成员"] = str(abs(int(m.group(1))))
+            print(f"  [恢复] 付费加入成员: 0 → {record['付费加入成员']}（从负昨日值恢复）")
+
     # 提取昨日收入（第一个出现的）
     m = re.search(r"累积收入.*?昨日收入\s+([\d.]+)", text, re.DOTALL)
     if m:
         record["昨日收入(元)"] = m.group(1)
-    m = re.search(r"总成员数.*?昨日加入成员\s+(\d+)", text, re.DOTALL)
+    # 昨日加入成员：提取正值（非负数）
+    m = re.search(r"数据概览.*?总成员数.*?昨日加入成员\s+(\d+)", text, re.DOTALL)
     if m:
         record["昨日加入成员"] = m.group(1)
+    else:
+        # 重置期显示负数时，昨日加入成员设为0
+        record["昨日加入成员"] = "0"
 
     # 特殊处理：有效期内成员数
     m = re.search(r"(\d+)\s*\n\s*总成员数\s*\n\s*总成员数\s*\n\s*(\d+)", text)
@@ -404,6 +446,19 @@ def parse_member_active(text):
         m = re.search(pattern, text)
         if m:
             record[field] = m.group(1)
+
+    # 数据重置期恢复：免费加入成员和退出成员为0时，从负昨日值恢复
+    if record.get("免费加入成员") == "0":
+        m = re.search(r"免费加入成员\s*\n\s*0\s*\n\s*昨日加入成员\s+(-\d+)", text)
+        if m:
+            record["免费加入成员"] = str(abs(int(m.group(1))))
+            print(f"  [恢复] 成员-免费加入成员: 0 → {record['免费加入成员']}")
+    if record.get("退出成员") == "0":
+        m = re.search(r"退出成员\s*\n\s*0\s*\n\s*昨日退出成员\s+(-\d+)", text)
+        if m:
+            record["退出成员"] = str(abs(int(m.group(1))))
+            print(f"  [恢复] 成员-退出成员: 0 → {record['退出成员']}")
+
     return record
 
 
