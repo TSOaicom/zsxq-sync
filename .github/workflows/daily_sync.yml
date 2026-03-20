@@ -2,8 +2,8 @@ name: 每日同步知识星球数据到飞书
 
 on:
   schedule:
-    # 每天北京时间早上 8:03（UTC 0:03）
-    - cron: '3 0 * * *'
+    # 每天北京时间 23:59（UTC 15:59）
+    - cron: '59 15 * * *'
   workflow_dispatch:  # 允许手动触发
 
 jobs:
