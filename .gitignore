@@ -1,0 +1,5 @@
+zsxq_storage_state.json
+zsxq_data_*.json
+__pycache__/
+*.pyc
+.env

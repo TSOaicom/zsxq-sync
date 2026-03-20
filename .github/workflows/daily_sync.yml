@@ -1,0 +1,48 @@
+name: 每日同步知识星球数据到飞书
+
+on:
+  schedule:
+    # 每天北京时间早上 8:03（UTC 0:03）
+    - cron: '3 0 * * *'
+  workflow_dispatch:  # 允许手动触发
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install dependencies
+        run: |
+          pip install -r requirements.txt
+          playwright install chromium
+          playwright install-deps chromium
+
+      - name: Restore cookies
+        run: echo '${{ secrets.ZSXQ_STORAGE_STATE }}' > zsxq_storage_state.json
+
+      - name: Run sync
+        env:
+          FEISHU_APP_ID: ${{ secrets.FEISHU_APP_ID }}
+          FEISHU_APP_SECRET: ${{ secrets.FEISHU_APP_SECRET }}
+          FEISHU_APP_TOKEN: ${{ secrets.FEISHU_APP_TOKEN }}
+          FEISHU_TABLE_ID: ${{ secrets.FEISHU_TABLE_ID }}
+          ZSXQ_GROUP_ID: ${{ secrets.ZSXQ_GROUP_ID }}
+          STORAGE_STATE_PATH: zsxq_storage_state.json
+        run: python daily_sync.py
+
+      - name: Upload refreshed cookies
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: zsxq-cookies-${{ github.run_number }}
+          path: zsxq_storage_state.json
+          retention-days: 7
