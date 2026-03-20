@@ -26,6 +26,8 @@ STORAGE_STATE_PATH = os.getenv("STORAGE_STATE_PATH", "zsxq_storage_state.json")
 DASHBOARD_URL = f"https://wx.zsxq.com/dashboard/{ZSXQ_GROUP_ID}/income"
 MEMBER_ACTIVE_URL = f"https://wx.zsxq.com/dashboard/{ZSXQ_GROUP_ID}/member_active"
 CONTENT_ACTIVE_URL = f"https://wx.zsxq.com/dashboard/{ZSXQ_GROUP_ID}/content_active"
+PROMOTION_CODE_URL = f"https://wx.zsxq.com/dashboard/{ZSXQ_GROUP_ID}/promotion_code"
+PROMOTION_DATA_URL = f"https://wx.zsxq.com/dashboard/{ZSXQ_GROUP_ID}/promotion_data"
 
 BJT = timezone(timedelta(hours=8))
 BASE = "https://open.feishu.cn/open-apis"
@@ -251,6 +253,46 @@ async def scrape_zsxq():
                 seen_c.add(c)
                 unique_contents.append(c)
 
+        # ── 4. 渠道二维码页面 ──
+        print(f"  打开: {PROMOTION_CODE_URL}")
+        await page.goto(PROMOTION_CODE_URL, wait_until="networkidle", timeout=60000)
+        await page.wait_for_timeout(5000)
+        channel_text = await page.evaluate("() => document.body.innerText")
+
+        # 提取渠道明细（逐页）
+        all_channels = []
+        for i in range(30):
+            rows = await page.evaluate("""() => {
+                return Array.from(document.querySelectorAll('ul li')).filter(li => {
+                    return /20\\d{2}\\//.test(li.innerText) && li.innerText.includes('\\n')
+                        && (li.innerText.includes('下载二维码') || li.innerText.includes('导出数据'));
+                }).map(li => li.innerText.trim());
+            }""")
+            if not rows:
+                break
+            all_channels.extend(rows)
+            can_next = await page.evaluate("""() => {
+                const btn = document.querySelector('.page-next');
+                if (!btn || btn.classList.contains('page-next-disabled')) return false;
+                btn.click();
+                return true;
+            }""")
+            if not can_next:
+                break
+            await page.wait_for_timeout(2500)
+        seen_ch = set()
+        unique_channels = []
+        for ch in all_channels:
+            if ch not in seen_ch:
+                seen_ch.add(ch)
+                unique_channels.append(ch)
+
+        # ── 5. 推广数据页面（获取优惠券数据） ──
+        print(f"  打开: {PROMOTION_DATA_URL}")
+        await page.goto(PROMOTION_DATA_URL, wait_until="networkidle", timeout=60000)
+        await page.wait_for_timeout(5000)
+        promotion_text = await page.evaluate("() => document.body.innerText")
+
         # 刷新 cookies
         await context.storage_state(path=STORAGE_STATE_PATH)
         await browser.close()
@@ -262,6 +304,9 @@ async def scrape_zsxq():
         "members": unique_members,
         "content_active_text": content_active_text,
         "contents": unique_contents,
+        "channel_text": channel_text,
+        "channels": unique_channels,
+        "promotion_text": promotion_text,
     }
 
 
@@ -434,6 +479,138 @@ def parse_content_detail(raw_rows):
     return records
 
 
+def parse_channel_overview(text):
+    """从渠道二维码页面文本解析概览数据"""
+    record = {}
+    patterns = {
+        "总渠道数": r"总渠道数\s*\n\s*(\d+)",
+        "渠道总访问次数": r"渠道总访问次数\s*\n\s*([\d,]+)",
+        "渠道昨日新增访问": r"渠道总访问次数\s*\n\s*[\d,]+\s*\n\s*昨日新增访问\s+(\d+)",
+        "渠道总加入人数": r"渠道总加入人数\s*\n\s*(\d+)",
+        "渠道昨日新增加入": r"渠道总加入人数\s*\n\s*\d+\s*\n\s*昨日新增人数\s+(\d+)",
+        "渠道总付费人数": r"渠道总付费人数\s*\n\s*(\d+)",
+        "渠道昨日新增付费": r"渠道总付费人数\s*\n\s*\d+\s*\n\s*昨日新增人数\s+(\d+)",
+        "渠道总收入(元)": r"渠道总收入\(元\)\s*\n\s*([\d,.]+)",
+        "渠道昨日新增收入(元)": r"渠道总收入.*?昨日新增收入\s+([\d,.]+)",
+    }
+    for field, pattern in patterns.items():
+        m = re.search(pattern, text, re.DOTALL)
+        if m:
+            record[field] = m.group(1).replace(",", "")
+    return record
+
+
+def parse_channel_detail(raw_rows):
+    """解析渠道明细文本行"""
+    records = []
+    for row in raw_rows:
+        parts = [p.strip() for p in row.split("\n") if p.strip()]
+        # 过滤掉操作按钮文字
+        parts = [p for p in parts if p not in ("下载二维码", "复制链接", "导出数据")]
+        # 格式: 渠道名 生成时间 访问人数 加入人数/付费人数 收入(元)
+        date_indices = [i for i, p in enumerate(parts) if re.match(r'\d{4}/\d{2}/\d{2}', p)]
+        if date_indices:
+            di = date_indices[0]
+            channel_name = parts[0] if di > 0 else ""
+            record = {
+                "渠道名": channel_name,
+                "生成时间": parts[di],
+                "访问人数": parts[di + 1] if di + 1 < len(parts) else "0",
+            }
+            # 加入人数/付费人数
+            if di + 2 < len(parts):
+                join_pay = parts[di + 2]
+                m = re.match(r'(\d+)\s*/\s*(\d+)', join_pay)
+                if m:
+                    record["加入人数"] = m.group(1)
+                    record["付费人数"] = m.group(2)
+                else:
+                    record["加入人数/付费人数"] = join_pay
+            # 收入
+            if di + 3 < len(parts):
+                record["收入(元)"] = parts[di + 3]
+            records.append(record)
+    return records
+
+
+def parse_promotion_overview(text):
+    """从推广数据页面解析额外概览数据"""
+    record = {}
+    patterns = {
+        "本月付费加入成员": r"本月付费加入成员\s*\n\s*(\d+)",
+        "上月加入成员": r"上月加入成员\s+(\d+)",
+        "成员拉新人数": r"成员拉新人数\s*\n\s*(\d+)",
+    }
+    for field, pattern in patterns.items():
+        m = re.search(pattern, text)
+        if m:
+            record[field] = m.group(1)
+    return record
+
+
+def parse_coupon_data(text):
+    """从推广数据页面文本解析优惠券数据"""
+    records = []
+    # 找到优惠券数据区域
+    coupon_section = re.search(r'优惠券数据.*?类型名称面额.*?\n(.*?)(?:拉新数据报表|$)', text, re.DOTALL)
+    if not coupon_section:
+        return records
+    section_text = coupon_section.group(1)
+    # 每个优惠券记录以 "新人券" 或 "续期券" 开头
+    coupon_blocks = re.split(r'\n(?=新人券|续期券)', section_text)
+    for block in coupon_blocks:
+        block = block.strip()
+        if not block:
+            continue
+        lines = [l.strip() for l in block.split("\n") if l.strip()]
+        if len(lines) < 5:
+            continue
+        # 过滤操作按钮
+        lines = [l for l in lines if l not in ("生成海报", "生成链接", "停止", "生成海报生成链接停止")]
+        record = {"类型": lines[0] if lines else ""}
+        # 名称是第二行
+        if len(lines) > 1:
+            record["名称"] = lines[1]
+        # 面额
+        for l in lines:
+            m = re.match(r'^(\d+)$', l)
+            if m and "面额(元)" not in record:
+                record["面额(元)"] = m.group(1)
+                break
+        # 有效期：起/止
+        starts = [l for l in lines if l.startswith("起 ")]
+        ends = [l for l in lines if l.startswith("止 ")]
+        if starts:
+            record["有效期起"] = starts[0].replace("起 ", "")
+        if ends:
+            record["有效期止"] = ends[0].replace("止 ", "")
+        # 总数/已用
+        for l in lines:
+            m = re.match(r'(\d+)/(\d+)', l)
+            if m:
+                record["总数"] = m.group(1)
+                record["已用"] = m.group(2)
+                break
+        # 状态
+        for status in ("进行中", "已过期", "已停止"):
+            if status in lines:
+                record["状态"] = status
+                break
+        # 访问数 (单独的数字行, 在总数/已用之后)
+        found_total = False
+        for l in lines:
+            if re.match(r'\d+/\d+', l):
+                found_total = True
+                continue
+            if found_total and re.match(r'^\d+$', l):
+                record["访问数"] = l
+                break
+
+        if record.get("名称"):
+            records.append(record)
+    return records
+
+
 # ──────────────────────────── 主流程 ────────────────────────────
 
 
@@ -453,6 +630,9 @@ async def main():
     print(f"  成员明细: {len(data['members'])} 条")
     print(f"  内容活跃页面: {len(data['content_active_text'])} 字符")
     print(f"  内容明细: {len(data['contents'])} 条")
+    print(f"  渠道页面: {len(data['channel_text'])} 字符")
+    print(f"  渠道明细: {len(data['channels'])} 条")
+    print(f"  推广页面: {len(data['promotion_text'])} 字符")
 
     # 2. 解析收入概览 + 推广转化
     print("\n[2/4] 解析数据...")
@@ -469,12 +649,24 @@ async def main():
     overview.update({f"内容-{k}": v for k, v in content_overview.items()})
     content_details = parse_content_detail(data["contents"])
 
+    # 5. 解析渠道数据
+    channel_overview = parse_channel_overview(data["channel_text"])
+    overview.update({f"渠道-{k}": v for k, v in channel_overview.items()})
+    channel_details = parse_channel_detail(data["channels"])
+
+    # 6. 解析推广数据（额外概览 + 优惠券）
+    promo_overview = parse_promotion_overview(data["promotion_text"])
+    overview.update({f"推广-{k}": v for k, v in promo_overview.items()})
+    coupon_details = parse_coupon_data(data["promotion_text"])
+
     print(f"  概览字段: {len(overview)} 个")
     for k, v in overview.items():
         print(f"    {k}: {v}")
     print(f"  交易记录: {len(transactions)} 条")
     print(f"  成员记录: {len(member_details)} 条")
     print(f"  内容记录: {len(content_details)} 条")
+    print(f"  渠道记录: {len(channel_details)} 条")
+    print(f"  优惠券记录: {len(coupon_details)} 条")
 
     # 3. 写入飞书
     print("\n[3/4] 写入飞书多维表格...")
@@ -516,6 +708,30 @@ async def main():
             print(f"  写入 {len(content_details)} 条内容明细...")
             for i in range(0, len(content_details), 500):
                 add_records(token, content_table_id, content_details[i:i+500])
+
+    # 写渠道明细
+    if channel_details:
+        channel_table_id = find_or_create_table(
+            token, "获客渠道明细",
+            ["渠道名", "生成时间", "访问人数", "加入人数", "付费人数", "收入(元)"]
+        )
+        if channel_table_id:
+            ensure_fields(token, channel_table_id, channel_details[0].keys())
+            print(f"  写入 {len(channel_details)} 条渠道明细...")
+            for i in range(0, len(channel_details), 500):
+                add_records(token, channel_table_id, channel_details[i:i+500])
+
+    # 写优惠券数据
+    if coupon_details:
+        coupon_table_id = find_or_create_table(
+            token, "优惠券数据",
+            ["类型", "名称", "面额(元)", "有效期起", "有效期止", "总数", "已用", "访问数", "状态"]
+        )
+        if coupon_table_id:
+            ensure_fields(token, coupon_table_id, coupon_details[0].keys())
+            print(f"  写入 {len(coupon_details)} 条优惠券数据...")
+            for i in range(0, len(coupon_details), 500):
+                add_records(token, coupon_table_id, coupon_details[i:i+500])
 
     print("\n" + "=" * 60)
     print("同步完成！")
